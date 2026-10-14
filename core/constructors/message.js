@@ -1,0 +1,763 @@
+let generateWAMessageFromContent,
+  generateWAMessageContent,
+  proto,
+  prepareWAMessageMedia,
+  generateForwardMessageContent,
+  getContentType,
+  downloadMediaMessage;
+const { loadBaileys } = require("../helpers");
+const baileysPromise = loadBaileys()
+  .then((baileys) => {
+    ({
+      generateWAMessageFromContent,
+      generateWAMessageContent,
+      proto,
+      prepareWAMessageMedia,
+      generateForwardMessageContent,
+      getContentType,
+      downloadMediaMessage,
+    } = baileys);
+  })
+  .catch((err) => {
+    console.error("Failed to load baileys:", err.message);
+    process.exit(1);
+  });
+const Base = require("./base");
+let config = require("../../config");
+const ReplyMessage = require("./reply-message");
+const fs = require("fs");
+const { genThumb } = require("../helpers");
+const { getTempPath } = require("../helpers");
+
+class Message extends Base {
+  constructor(client, data) {
+    super(client);
+    if (data) this._patch(data);
+  }
+  _patch(data) {
+    this.id = data.key.id === undefined ? undefined : data.key.id;
+    this.jid = data.key.remoteJid;
+    this.isGroup = data.key.remoteJid.endsWith("@g.us");
+    this.fromMe = data.key.fromMe;
+    this.fromBot = data.key.id?.startsWith("3EB0");
+
+    if (this.isGroup) {
+      this.sender = data.key.participant || data.key.participantAlt;
+    } else {
+      this.sender = data.key.remoteJid.endsWith("lid")
+        ? data.key.remoteJid
+        : data.key.remoteJidAlt;
+    }
+
+    const botNumeric = this.client.user?.lid?.split(":")[0] + "@lid";
+    const senderNumeric = this.sender?.split("@")[0];
+
+    // check if sender is sudo using SUDO_MAP
+    let isSudoUser = false;
+    if (config.SUDO_MAP) {
+      try {
+        const sudoMap = JSON.parse(config.SUDO_MAP);
+        if (Array.isArray(sudoMap)) {
+          isSudoUser = sudoMap.includes(this.sender);
+        }
+      } catch (e) {
+        isSudoUser = false;
+      }
+    }
+
+    this.fromOwner =
+      data.key.fromMe || senderNumeric === botNumeric || isSudoUser;
+
+    this.senderName = data.pushName;
+    this.myjid = botNumeric;
+    this.message =
+      data.message?.extendedTextMessage?.text ??
+      data.message?.conversation ??
+      "";
+    this.text = this.message;
+    this.timestamp = data.messageTimestamp;
+    this.data = data;
+
+    this.ephemeral = this._extractEphemeralSettings(data);
+
+    this.reply_message = false;
+    this.quoted = false;
+
+    const contextInfo =
+      data.message?.extendedTextMessage?.contextInfo ||
+      data.message?.stickerMessage?.contextInfo;
+
+    if (contextInfo?.quotedMessage) {
+      contextInfo.remoteJid = contextInfo.remoteJid || this.jid;
+      this.reply_message = new ReplyMessage(this.client, contextInfo);
+
+      const quotedParticipantJid = contextInfo.participant;
+      this.quoted = {
+        key: {
+          remoteJid: contextInfo.remoteJid,
+          fromMe: this.reply_message.fromMe,
+          id: this.reply_message.id,
+          participant: quotedParticipantJid,
+        },
+        message: this.reply_message.data.message,
+      };
+    }
+    if (data.message.hasOwnProperty("interactiveResponseMessage")) {
+      this.list = JSON.parse(
+        data.message.interactiveResponseMessage.nativeFlowResponseMessage
+          .paramsJson
+      ).id;
+      this.isOwnResponse =
+        data.message.interactiveResponseMessage?.contextInfo?.participant &&
+        data.message.interactiveResponseMessage.contextInfo.participant.split(
+          "@"
+        )[0] === this.myjid;
+    } else {
+      this.list = null;
+    }
+    if (data.message.hasOwnProperty("templateButtonReplyMessage")) {
+      this.button = data.message.templateButtonReplyMessage.selectedId;
+    } else {
+      this.button = null;
+    }
+    if (data.hasOwnProperty("messageStubType")) {
+      this.update = data.messageStubType;
+      this.participant = data.messageStubParameters;
+    } else {
+      this.update = null;
+    }
+    if (
+      data.message.hasOwnProperty("extendedTextMessage") &&
+      data.message.extendedTextMessage.hasOwnProperty("contextInfo") === true &&
+      data.message.extendedTextMessage.contextInfo.hasOwnProperty(
+        "mentionedJid"
+      )
+    ) {
+      this.mention = data.message.extendedTextMessage.contextInfo.mentionedJid;
+    } else {
+      this.mention = null;
+    }
+
+    this.reply = this.sendReply;
+
+    return super._patch(data);
+  }
+
+  _extractEphemeralSettings(data) {
+    const contextInfo =
+      data.message?.extendedTextMessage?.contextInfo ||
+      data.message?.conversation?.contextInfo ||
+      data.message?.imageMessage?.contextInfo ||
+      data.message?.videoMessage?.contextInfo ||
+      data.message?.audioMessage?.contextInfo ||
+      data.message?.documentMessage?.contextInfo ||
+      data.message?.stickerMessage?.contextInfo;
+
+    if (contextInfo && contextInfo.expiration) {
+      return {
+        expiration: contextInfo.expiration,
+        ephemeralSettingTimestamp: contextInfo.ephemeralSettingTimestamp,
+        disappearingMode: contextInfo.disappearingMode,
+      };
+    }
+    return null;
+  }
+
+  async react(emoji, key = this.data.key) {
+    if (!emoji) throw new Error("Emoji is required for reaction.");
+    return await this.client.sendMessage(key.remoteJid, {
+      react: { text: emoji, key },
+    });
+  }
+
+  _isGroupStatusType(type = "") {
+    if (!type || typeof type !== "string") return false;
+    const normalized = type.toLowerCase();
+    return [
+      "groupstatus",
+      "group-status",
+      "group_status",
+      "groupstatusmessage",
+      "groupstatusmessagev2",
+      "gstatus",
+      "gs",
+    ].includes(normalized);
+  }
+
+  _buildGroupStatusPayload(content, messageOptions = {}) {
+    const source =
+      content &&
+      typeof content === "object" &&
+      !Buffer.isBuffer(content) &&
+      content.groupStatusMessage
+        ? content.groupStatusMessage
+        : content;
+
+    if (typeof source === "string") {
+      return { text: source, ...messageOptions };
+    }
+
+    if (Buffer.isBuffer(source) || source instanceof Uint8Array) {
+      const mediaType = (messageOptions.mediaType || "image").toLowerCase();
+      const payload = { ...messageOptions };
+      delete payload.mediaType;
+
+      if (mediaType === "video") {
+        payload.video = source;
+      } else if (mediaType === "audio") {
+        payload.audio = source;
+      } else {
+        payload.image = source;
+      }
+      return payload;
+    }
+
+    if (source && typeof source === "object") {
+      return { ...source, ...messageOptions };
+    }
+
+    return { text: "", ...messageOptions };
+  }
+
+  async sendGroupStatus(content, options = {}) {
+    await baileysPromise;
+
+    if (!this.jid.endsWith("@g.us")) {
+      throw new Error("Group status can only be sent to a group chat.");
+    }
+
+    if (
+      typeof generateWAMessageFromContent !== "function" ||
+      typeof generateWAMessageContent !== "function"
+    ) {
+      throw new Error("Baileys helpers are not ready to send group status.");
+    }
+
+    const { quoted, ...messageOptions } = options;
+    const payload = this._buildGroupStatusPayload(content, messageOptions);
+
+    if ((payload.image || payload.video) && payload.text && !payload.caption) {
+      payload.caption = payload.text;
+      delete payload.text;
+    }
+
+    const userJid = this.client.user?.id || this.client.user?.jid;
+    const waMsgContent =
+      payload.message && typeof payload.message === "object"
+        ? payload.message
+        : await generateWAMessageContent(payload, {
+            upload: this.client.waUploadToServer,
+            mediaCache: this.client.mediaCache,
+            options: this.client.options,
+            logger: this.client.logger,
+            userJid,
+            jid: this.jid,
+          });
+
+    const groupStatusContent = {
+      groupStatusMessageV2: {
+        message: waMsgContent.message || waMsgContent,
+      },
+    };
+
+    const waMessage = generateWAMessageFromContent(
+      this.jid,
+      groupStatusContent,
+      {
+        quoted,
+        userJid,
+      }
+    );
+
+    await this.client.relayMessage(this.jid, waMessage.message, {
+      messageId: waMessage.key.id,
+    });
+
+    return waMessage;
+  }
+
+  async sendMessage(content, type = "text", options = {}) {
+    const { ephemeralExpiration, quoted, ...messageOptions } = options;
+
+    const realOptions = {};
+    if (this.ephemeral && !ephemeralExpiration) {
+      realOptions.ephemeralExpiration = this.ephemeral.expiration;
+    } else if (ephemeralExpiration) {
+      realOptions.ephemeralExpiration = ephemeralExpiration;
+    }
+    if (quoted) {
+      realOptions.quoted = quoted;
+    }
+
+    const hasGroupStatusPayload =
+      content &&
+      typeof content === "object" &&
+      !Buffer.isBuffer(content) &&
+      content.groupStatusMessage;
+
+    if (this._isGroupStatusType(type) || hasGroupStatusPayload) {
+      return await this.sendGroupStatus(content, {
+        ...messageOptions,
+        quoted: realOptions.quoted,
+      });
+    }
+
+    if (type == "text") {
+      const textMessage = { text: content, ...messageOptions };
+      return await this.client.sendMessage(this.jid, textMessage, realOptions);
+    }
+    if (type == "image") {
+      const { thumbnail, ...otherOptions } = messageOptions;
+      const imageMessage = { image: content, ...otherOptions };
+
+      if (thumbnail) {
+        const thumbBuffer = await genThumb(thumbnail);
+        imageMessage.jpegThumbnail = thumbBuffer;
+      }
+
+      return await this.client.sendMessage(this.jid, imageMessage, realOptions);
+    }
+    if (type == "video") {
+      const { thumbnail, ...otherOptions } = messageOptions;
+      let msgContent = { video: content, ...otherOptions };
+      if (thumbnail) {
+        const thumbBuffer = await genThumb(thumbnail);
+        msgContent.jpegThumbnail = thumbBuffer;
+      }
+      return await this.client.sendMessage(this.jid, msgContent, realOptions);
+    }
+    if (type == "audio") {
+      if (messageOptions.ptt) {
+        try {
+          const { toBuffer, convertToOgg } = require("../helpers");
+          const inputBuffer = await toBuffer(content);
+          let oggBuffer = null;
+          if (inputBuffer) {
+            try {
+              oggBuffer = await convertToOgg(inputBuffer);
+            } catch (e) {
+              console.error(
+                "PTT conversion failed, falling back to original content:",
+                e
+              );
+            }
+          }
+
+          if (oggBuffer && Buffer.isBuffer(oggBuffer)) {
+            return await this.client.sendMessage(
+              this.jid,
+              {
+                audio: oggBuffer,
+                mimetype: "audio/ogg; codecs=opus",
+                ptt: true,
+                ...messageOptions,
+              },
+              realOptions
+            );
+          }
+          return await this.client.sendMessage(
+            this.jid,
+            {
+              audio: content,
+              mimetype: "audio/ogg",
+              ptt: true,
+              ...messageOptions,
+            },
+            realOptions
+          );
+        } catch (err) {
+          console.error("Error preparing ptt audio:", err);
+          return await this.client.sendMessage(
+            this.jid,
+            { audio: content, mimetype: "audio/ogg", ...messageOptions },
+            realOptions
+          );
+        }
+      }
+
+      return await this.client.sendMessage(
+        this.jid,
+        { audio: content, mimetype: "audio/mp4", ...messageOptions },
+        realOptions
+      );
+    }
+    if (type == "sticker") {
+      return await this.client.sendMessage(
+        this.jid,
+        { sticker: content, ...messageOptions },
+        realOptions
+      );
+    }
+    if (type == "document") {
+      const { fileName, mimetype, ...otherOptions } = messageOptions;
+      const documentMessage = {
+        document: content,
+        fileName: fileName || "document",
+        mimetype: mimetype || "application/octet-stream",
+        ...otherOptions,
+      };
+
+      return await this.client.sendMessage(
+        this.jid,
+        documentMessage,
+        realOptions
+      );
+    }
+  }
+  async send(content, type = "text", options = {}) {
+    return await this.sendMessage(content, type, options);
+  }
+
+  async download(type = "file") {
+    if (this.data.message.ptvMessage)
+      this.data.message = JSON.parse(
+        JSON.stringify(this.data.message).replace("ptvMessage", "videoMessage")
+      );
+
+    const ext =
+      this.data.message[Object.keys(this.data.message)[0]].mimetype?.split(
+        "/"
+      )[1];
+    const filename = getTempPath(`temp.${ext}`);
+
+    if (type === "buffer") {
+      const buffer = await downloadMediaMessage(this.data, "buffer");
+      return buffer;
+    } else {
+      const stream = await downloadMediaMessage(this.data, "stream");
+      const writeStream = fs.createWriteStream(filename);
+      stream.pipe(writeStream);
+      await new Promise((resolve, reject) => {
+        writeStream.on("finish", resolve);
+        writeStream.on("error", reject);
+      });
+      return filename;
+    }
+  }
+
+  async sendReply(content, type = "text", options = {}) {
+    const optionsWithQuoted = {
+      ...options,
+      quoted: options.quoted || this.data,
+    };
+    return await this.sendMessage(content, type, optionsWithQuoted);
+  }
+  async edit(text = "", _jid = this.jid, _key = false) {
+    return await this.client.sendMessage(_jid, {
+      text,
+      edit: _key,
+    });
+  }
+  async getThumb(url) {
+    return await genThumb(url);
+  }
+
+  // @deprecated
+  async sendInteractiveMessage(jid, list, options) {
+    return null;
+  }
+
+  async sendButtonMessage(content, options = {}) {
+    await baileysPromise;
+    const { toBuffer } = require("../helpers");
+    const {
+      buildInteractiveButtons,
+      validateAuthoringButtons,
+      validateInteractiveMessageContent,
+      getButtonType,
+      getButtonArgs,
+    } = require("../helpers");
+
+    const {
+      title = "",
+      footer = "",
+      header = "",
+      buttons = [],
+      image = null,
+      video = null,
+      document = null,
+      fileName = null,
+      mimetype = null,
+      jpegThumbnail = null,
+      contextInfo = {},
+      externalAdReply = null,
+      quoted = null,
+      ephemeralExpiration = null,
+    } = content;
+
+    if (!buttons || buttons.length === 0) {
+      throw new Error("At least one button is required");
+    }
+
+    // validate and clean buttons
+    const { errors: btnErrors, warnings: btnWarnings, cleaned: cleanedButtons } = validateAuthoringButtons(buttons);
+    if (btnErrors.length > 0) {
+      throw new Error("Button validation failed: " + btnErrors.join("; "));
+    }
+    if (btnWarnings.length > 0) {
+      console.warn("Button warnings:", btnWarnings);
+    }
+
+    const interactiveButtons = buildInteractiveButtons(cleanedButtons);
+
+    let mediaPayload = null;
+
+    try {
+      if (image) {
+        if (typeof image === "string" && (image.startsWith("http://") || image.startsWith("https://"))) {
+          mediaPayload = { image: { url: image } };
+        } else {
+          const imageBuffer = await toBuffer(image);
+          mediaPayload = { image: imageBuffer };
+        }
+
+        const prepared = await prepareWAMessageMedia(
+          mediaPayload,
+          { upload: this.client.waUploadToServer }
+        );
+        if (prepared.imageMessage) {
+          mediaPayload = prepared;
+        }
+      } else if (video) {
+        if (typeof video === "string" && (video.startsWith("http://") || video.startsWith("https://"))) {
+          mediaPayload = { video: { url: video } };
+        } else {
+          const videoBuffer = await toBuffer(video);
+          mediaPayload = { video: videoBuffer };
+        }
+
+        const prepared = await prepareWAMessageMedia(
+          mediaPayload,
+          { upload: this.client.waUploadToServer }
+        );
+        if (prepared.videoMessage) {
+          mediaPayload = prepared;
+        }
+      } else if (document) {
+        let docPayload;
+        if (typeof document === "string" && (document.startsWith("http://") || document.startsWith("https://"))) {
+          docPayload = { document: { url: document } };
+        } else {
+          const docBuffer = await toBuffer(document);
+          docPayload = { document: docBuffer };
+        }
+
+        if (jpegThumbnail) {
+          docPayload.jpegThumbnail = jpegThumbnail;
+        }
+
+        const prepared = await prepareWAMessageMedia(
+          docPayload,
+          { upload: this.client.waUploadToServer }
+        );
+        if (prepared.documentMessage) {
+          if (fileName) {
+            prepared.documentMessage.fileName = fileName;
+          }
+          if (mimetype) {
+            prepared.documentMessage.mimetype = mimetype;
+          }
+          mediaPayload = prepared;
+        }
+      }
+    } catch (err) {
+      console.error("Error preparing media for button message:", err.message);
+      mediaPayload = null;
+    }
+
+    const interactiveMessageBody = {
+      body: { text: title || "" },
+      footer: { text: footer || "" },
+      nativeFlowMessage: {
+        buttons: interactiveButtons,
+      },
+    };
+
+    if (mediaPayload) {
+      interactiveMessageBody.header = {
+        title: header || "",
+        hasMediaAttachment: true,
+        ...mediaPayload,
+      };
+    } else {
+      interactiveMessageBody.header = {
+        title: header || "",
+        hasMediaAttachment: false,
+      };
+    }
+
+    let finalContextInfo = {
+      mentionedJid: contextInfo.mentionedJid || [],
+      forwardingScore: contextInfo.forwardingScore || 0,
+      isForwarded: contextInfo.isForwarded || false,
+      ...contextInfo,
+    };
+
+    if (externalAdReply) {
+      finalContextInfo.externalAdReply = {
+        title: externalAdReply.title || "",
+        body: externalAdReply.body || "",
+        mediaType: externalAdReply.mediaType || 1,
+        thumbnailUrl: externalAdReply.thumbnailUrl || "",
+        mediaUrl: externalAdReply.mediaUrl || "",
+        sourceUrl: externalAdReply.sourceUrl || "",
+        showAdAttribution: externalAdReply.showAdAttribution || false,
+        renderLargerThumbnail:
+          externalAdReply.renderLargerThumbnail || false,
+        ...externalAdReply,
+      };
+    }
+
+    if (Object.keys(finalContextInfo).length > 0) {
+      interactiveMessageBody.contextInfo = finalContextInfo;
+    }
+
+    const messageContent = {
+      interactiveMessage: interactiveMessageBody,
+    };
+
+    const { errors: contentErrors, warnings: contentWarnings, valid: contentValid } = validateInteractiveMessageContent(messageContent);
+    if (!contentValid) {
+      throw new Error("Interactive message validation failed: " + contentErrors.join("; "));
+    }
+    if (contentWarnings.length > 0) {
+      console.warn("Interactive message warnings:", contentWarnings);
+    }
+
+    const userJid = this.client.user?.id || this.client.user?.jid;
+    const waMessage = generateWAMessageFromContent(this.jid, messageContent, {
+      quoted: quoted || null,
+      userJid,
+    });
+
+    const realOptions = {};
+    if (this.ephemeral && !ephemeralExpiration) {
+      realOptions.ephemeralExpiration = this.ephemeral.expiration;
+    } else if (ephemeralExpiration) {
+      realOptions.ephemeralExpiration = ephemeralExpiration;
+    }
+
+    // Get button args for proper relay
+    const buttonType = getButtonType(messageContent);
+    let additionalNodes = [];
+    if (buttonType) {
+      additionalNodes.push(getButtonArgs(messageContent));
+    }
+
+    return await this.client.relayMessage(this.jid, waMessage.message, {
+      messageId: waMessage.key.id,
+      additionalNodes,
+    });
+  }
+
+  // @deprecated
+  async forwardMessage(jid, message, options = {}) {
+    let vtype;
+    let mtype = getContentType(message.message);
+    if (options.readViewOnce) {
+      message.message =
+        message.message &&
+        message.message.ephemeralMessage &&
+        message.message.ephemeralMessage.message
+          ? message.message.ephemeralMessage.message
+          : message.message || undefined;
+      vtype = Object.keys(message.message.viewOnceMessage.message)[0];
+      delete (message.message && message.message.ignore
+        ? message.message.ignore
+        : message.message || undefined);
+      delete message.message.viewOnceMessage.message[vtype].viewOnce;
+      message.message = {
+        ...message.message.viewOnceMessage.message,
+      };
+    }
+
+    if (options.mentions) {
+      message.message[mtype].contextInfo.mentionedJid = options.mentions;
+    }
+    let content = generateForwardMessageContent(message, false);
+    let content_type = getContentType(content);
+    if (options.ptt) {
+      content[content_type].ptt = options.ptt;
+    }
+    if (options.audiowave) {
+      content[content_type].waveform = options.audiowave;
+    }
+    if (options.seconds) {
+      content[content_type].seconds = options.seconds;
+    }
+    if (options.fileLength) {
+      content[content_type].fileLength = options.fileLength;
+    }
+    if (options.caption) {
+      content[content_type].caption = options.caption;
+    }
+    if (options.contextInfo) {
+      content[content_type].contextInfo = options.contextInfo;
+    }
+    if (options.mentions) {
+      content[content_type].contextInfo.mentionedJid = options.mentions;
+    }
+    let context = {};
+    if (mtype != "conversation") context = message.message[mtype].contextInfo;
+    content[content_type].contextInfo = {
+      ...context,
+      ...content[content_type].contextInfo,
+    };
+    var waMessage = generateWAMessageFromContent(
+      jid,
+      content,
+      options
+        ? {
+            ...content[content_type],
+            ...options,
+            ...(options.contextInfo
+              ? {
+                  contextInfo: {
+                    ...content[content_type].contextInfo,
+                    ...options.contextInfo,
+                  },
+                }
+              : {}),
+          }
+        : {}
+    );
+    await this.client.relayMessage(jid, waMessage.message, {
+      messageId: waMessage.key.id,
+    });
+    return waMessage;
+  }
+
+  /**
+   * Set ephemeral expiration for messages
+   * @param {number} expiration - Expiration time in seconds (e.g., 604800 for 7 days)
+   */
+  setEphemeral(expiration) {
+    this.ephemeral = {
+      expiration: expiration,
+      ephemeralSettingTimestamp: Math.floor(Date.now() / 1000).toString(),
+      disappearingMode: {
+        initiator: "CHANGED_IN_CHAT",
+        trigger: "CHAT_SETTING",
+        initiatedByMe: true,
+      },
+    };
+  }
+
+  /**
+   * Check if the current chat has disappearing messages enabled
+   * @returns {boolean}
+   */
+  hasEphemeralMessages() {
+    return this.ephemeral !== null;
+  }
+
+  /**
+   * Get ephemeral expiration time
+   * @returns {number|null} - Expiration time in seconds or null if not set
+   */
+  getEphemeralExpiration() {
+    return this.ephemeral ? this.ephemeral.expiration : null;
+  }
+}
+
+module.exports = Message;
